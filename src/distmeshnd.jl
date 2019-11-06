@@ -15,11 +15,10 @@
         d(p) = sqrt(sum(p.^2))-1
         p,t = distmeshnd(d,huniform,0.2)
 """
-function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T,ReTri}=DistMeshSetup(), ::Type{VertType}=GeometryBasics.Point{3,Float64}; origin=VertType(-1,-1,-1),
+function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T}=DistMeshSetup(), ::Type{VertType}=GeometryBasics.Point{3,Float64}; origin=VertType(-1,-1,-1),
                                                                        widths=VertType(2,2,2),
                                                                        fix::Vector{VertType}=VertType[],
-                                                                       stats=false,
-                                                                       distribution=:regular) where {VertType, T, ReTri}
+                                                                       stats=false) where {VertType, T}
 
     ptol=setup.ptol
     L0mult=1+.4/2^2
@@ -40,9 +39,9 @@ function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T
     # 'fix' points that do not move
     p = copy(fix)
 
-    if distribution == :regular
+    if setup.initial_points === :regular
         simplecubic!(fdist, p, h, setup.iso, origin, widths, VertType)
-    elseif distribution == :packed
+    elseif setup.intial_points === :packed
         # face-centered cubic point distribution
         facecenteredcubic!(fdist, p, h, setup.iso, origin, widths, VertType)
     end
@@ -62,21 +61,24 @@ function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T
     tris = NTuple{3,Int32}[] # array to store triangles used for quality checks
     triset = Set{NTuple{3,Int32}}() # set for triangles to ensure uniqueness
     qualities = eltype(VertType)[]
-    #maxmoves = eltype(VertType)[]
+    maxmoves = eltype(VertType)[]
 
     # information on each iteration
     statsdata = DistMeshStatistics()
+    last_retri = 0 # iterations since last retriangulation
 
     @inbounds while true
         # Retriangulation by Delaunay
-
+        if length(maxmoves) == setup.maxmove_delta
+            popfirst!(maxmoves)
+        end
+        lcount > 0 && push!(maxmoves, maxmove) # just dont include the very first iteration
         # if large move, retriangulation
-        if ReTri <: RetriangulateMaxMove && maxmove>setup.retriangulation_criteria.ttol*h
+        if lcount < 7 && maxmove > setup.ttol*h || last_retri > setup.maxmove_delta_delay && maxmove > sum(maxmoves)/length(maxmoves)
             triangulation = delaunayn(p)
             t_d = triangulation.tetrahedra
             resize!(t, length(t_d))
             copyto!(t, t_d) # we need to copy since we have a shared reference with tetgen
-            sort!(t) # sort tetrahedra so points are closer in mem
 
             # average points to get mid point of each tetrahedra
             # if the mid point of the tetrahedra is outside of
@@ -115,8 +117,12 @@ function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T
             resize!(L, length(pair))
             resize!(L0, length(pair))
 
+            empty!(maxmoves)
+            last_retri = 0
             stats && push!(statsdata.retriangulations, lcount)
         end
+
+        last_retri = last_retri + 1
 
         # 6. Move mesh points based on edge lengths L and forces F
         Lsum = zero(eltype(L))
