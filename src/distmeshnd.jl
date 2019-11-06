@@ -25,7 +25,7 @@ function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T
     L0mult=1+.4/2^2
     deltat=setup.deltat
     geps=1e-1*h+setup.iso
-
+    VTE = eltype(VertType)
     deps = sqrt(eps(T)) # epsilon for computing central difference
     #ptol=.001; ttol=.1; L0mult=1+.4/2^(dim-1); deltat=.2; geps=1e-1*h;
 
@@ -56,7 +56,7 @@ function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T
     L = eltype(VertType)[] # vector length of each edge
     L0 = eltype(VertType)[] # desired edge length computed by dh (edge length function)
     t = GeometryBasics.SimplexFace{4,Int32}[] # tetrahedra indices from delaunay triangulation
-    maxmove = typemax(eltype(VertType)) # stores an iteration max movement for retriangulation
+    maxmove = typemax(VTE) # stores an iteration max movement for retriangulation
 
     # array for tracking quality metrics
     tris = NTuple{3,Int32}[] # array to store triangles used for quality checks
@@ -118,19 +118,28 @@ function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T
             stats && push!(statsdata.retriangulations, lcount)
         end
 
+        # Lock for thread-safe array access
+        spin_lock = Threads.SpinLock()
+
         # 6. Move mesh points based on edge lengths L and forces F
-        Lsum = zero(eltype(L))
-        L0sum = zero(eltype(L0))
-        for i in eachindex(pair)
+        Lsum = Threads.Atomic{VTE}(zero(eltype(L)))
+        L0sum = Threads.Atomic{VTE}(zero(eltype(L0)))
+        Threads.@threads for i in eachindex(pair)
             pb = pair[i]
             b1 = p[pb[1]]
             b2 = p[pb[2]]
             barvec = b1 - b2 # bar vector
+            li = sqrt(sum(barvec.^2)) # length
+            l0i = fh((b1+b2)./2)
+            li3 = li.^3
+            l0i3 = l0i.^3
+
+            # set index safely
             bars[i] = barvec
-            L[i] = sqrt(sum(barvec.^2)) # length
-            L0[i] = fh((b1+b2)./2)
-            Lsum = Lsum + L[i].^3
-            L0sum = L0sum + L0[i].^3
+            L[i] = li
+            L0[i] = l0i
+            Threads.atomic_add!(Lsum, li3)
+            Threads.atomic_add!(L0sum, l0i3)
         end
 
         # zero out force at each node
@@ -138,16 +147,20 @@ function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T
             dp[i] = zero(VertType)
         end
 
-        for i in eachindex(pair)
-            L0_f = L0[i].*L0mult.*cbrt(Lsum/L0sum)
+        Ls = Lsum[]
+        L0s = L0sum[]
+        Threads.@threads for i in eachindex(pair)
+            L0_f = L0[i].*L0mult.*cbrt(Ls/L0s)
             # compute force vectors
             F = max(L0_f-L[i],zero(eltype(L0)))
             FBar = bars[i].*F./L[i]
             # add the force vector to the node
             b1 = pair[i][1]
             b2 = pair[i][2]
+            lock(spin_lock)
             dp[b1] = dp[b1] .+ FBar
             dp[b2] = dp[b2] .- FBar
+            unlock(spin_lock)
         end
 
         # Zero out forces on fix points
@@ -157,8 +170,8 @@ function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T
 
         # apply point forces and
         # bring outside points back to the boundary
-        maxdp = typemin(eltype(VertType))
-        maxmove = typemin(eltype(VertType))
+        maxdp = typemin(VTE) # atomics
+        maxmove = typemin(VTE)
         for i in eachindex(p)
 
             p0 = p[i] # store original point location
@@ -167,11 +180,13 @@ function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T
             d = fdist(p[i])
 
             if d < -geps
-                maxdp = max(maxdp, deltat*sqrt(sum(dp[i].^2)))
+                mdp = deltat*sqrt(sum(dp[i].^2))
+                maxdp = max(maxdp, mdp)
             end
 
             if d <= setup.iso
-                maxmove = max(sqrt(sum((p[i]-p0).^2)),maxmove) # determine movements
+                mv = sqrt(sum((p[i]-p0).^2))
+                maxmove = max(maxmove,mv) # determine movements
                 continue
             end
 
@@ -184,7 +199,8 @@ function distmesh(fdist::Function,fh::Function,h::Number, setup::DistMeshSetup{T
             grad = VertType(dx,dy,dz) #normalize?
             # project back to boundary
             p[i] = p[i] .- grad.*(d+setup.iso)
-            maxmove = max(sqrt(sum((p[i]-p0).^2)),maxmove)
+            mv = sqrt(sum((p[i]-p0).^2))
+            maxmove = max(maxmove,mv)
         end
 
         # increment iteration counter
